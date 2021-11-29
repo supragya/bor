@@ -10,8 +10,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ethereum/go-ethereum/accounts"
 	"github.com/ethereum/go-ethereum/accounts/keystore"
 	"github.com/ethereum/go-ethereum/command/server/proto"
+	"github.com/ethereum/go-ethereum/consensus/bor"
 	"github.com/ethereum/go-ethereum/eth"
 	"github.com/ethereum/go-ethereum/eth/tracers"
 	"github.com/ethereum/go-ethereum/ethstats"
@@ -95,13 +97,44 @@ func NewServer(config *Config) (*Server, error) {
 	}
 
 	// setup account manager (only keystore)
-	{
-		keydir := stack.KeyStoreDir()
-		n, p := keystore.StandardScryptN, keystore.StandardScryptP
-		if config.Accounts.UseLightweightKDF {
-			n, p = keystore.LightScryptN, keystore.LightScryptP
+	// Not used for RPC endpoints as personal/wallet endpoints will be deprecated
+	/*
+		{
+			keydir := stack.KeyStoreDir()
+			n, p := keystore.StandardScryptN, keystore.StandardScryptP
+			if config.Accounts.UseLightweightKDF {
+				n, p = keystore.LightScryptN, keystore.LightScryptP
+			}
+			stack.AccountManager().AddBackend(keystore.NewKeyStore(keydir, n, p))
 		}
-		stack.AccountManager().AddBackend(keystore.NewKeyStore(keydir, n, p))
+	*/
+
+	// create a new account manager, only for the scope of this function
+	accountManager := accounts.NewManager(&accounts.Config{})
+
+	// register backend to account manager with keystore for signing
+	keydir := stack.KeyStoreDir()
+	n, p := keystore.StandardScryptN, keystore.StandardScryptP
+	if config.Accounts.UseLightweightKDF {
+		n, p = keystore.LightScryptN, keystore.LightScryptP
+	}
+	accountManager.AddBackend(keystore.NewKeyStore(keydir, n, p))
+
+	// get the etherbase
+	eb, err := srv.backend.Etherbase()
+	if err != nil {
+		log.Error("Cannot start mining without etherbase", "err", err)
+		return nil, fmt.Errorf("etherbase missing: %v", err)
+	}
+
+	// Authorize the consensus to sign using wallet signer
+	if bor, ok := srv.backend.Engine().(*bor.Bor); ok {
+		wallet, err := accountManager.Find(accounts.Account{Address: eb})
+		if wallet == nil || err != nil {
+			log.Error("Etherbase account unavailable locally", "err", err)
+			return nil, fmt.Errorf("signer missing: %v", err)
+		}
+		bor.Authorize(eb, wallet.SignData)
 	}
 
 	// sealing (if enabled)
