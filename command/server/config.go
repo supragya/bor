@@ -363,6 +363,9 @@ type AccountsConfig struct {
 
 	// UseLightweightKDF enables a faster but less secure encryption of accounts
 	UseLightweightKDF bool `hcl:"use-lightweight-kdf,optional"`
+
+	// DisableBorWallet disables the personal wallet endpoints
+	DisableBorWallet bool `hcl:"disable-bor-wallet,optional"`
 }
 
 func DefaultConfig() *Config {
@@ -482,6 +485,7 @@ func DefaultConfig() *Config {
 			PasswordFile:        "",
 			AllowInsecureUnlock: false,
 			UseLightweightKDF:   false,
+			DisableBorWallet:    false,
 		},
 		GRPC: &GRPCConfig{
 			Addr: ":3131",
