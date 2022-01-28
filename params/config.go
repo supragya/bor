@@ -522,6 +522,7 @@ func (c *BorConfig) calculateBorConfigHelper(field map[string]uint64, number uin
 			return field[keys[i]]
 		}
 	}
+	// log.Info("Bor Backup multiplier", "multiplier", field[keys[len(keys)-1]])
 	return field[keys[len(keys)-1]]
 }
 

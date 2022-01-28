@@ -118,6 +118,7 @@ var (
 		utils.MaxPeersFlag,
 		utils.MaxPendingPeersFlag,
 		utils.MiningEnabledFlag,
+		utils.MiningCBSealerFlag,
 		utils.MinerThreadsFlag,
 		utils.MinerNotifyFlag,
 		utils.LegacyMinerGasTargetFlag,

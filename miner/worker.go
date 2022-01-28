@@ -17,9 +17,13 @@
 package miner
 
 import (
+	"bufio"
 	"bytes"
+	b64 "encoding/base64"
+	"encoding/json"
 	"errors"
 	"math/big"
+	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -87,6 +91,7 @@ type environment struct {
 	uncles    mapset.Set     // uncle set
 	tcount    int            // tx count in cycle
 	gasPool   *core.GasPool  // available gas used to pack transactions
+	profit    *big.Int
 
 	header   *types.Header
 	txs      []*types.Transaction
@@ -572,6 +577,7 @@ func (w *worker) taskLoop() {
 	for {
 		select {
 		case task := <-w.taskCh:
+			log.Info("Taskloop", "new sealing task came in")
 			if w.newTaskHook != nil {
 				w.newTaskHook(task)
 			}
@@ -588,9 +594,11 @@ func (w *worker) taskLoop() {
 				continue
 			}
 			w.pendingMu.Lock()
+			log.Info("Taskloop", "setting sealHash")
 			w.pendingTasks[sealHash] = task
 			w.pendingMu.Unlock()
 
+			log.Info("Taskloop", "engine sealing sarted")
 			if err := w.engine.Seal(w.chain, task.block, w.resultCh, stopCh); err != nil {
 				log.Warn("Block sealing failed", "err", err)
 			}
@@ -608,6 +616,7 @@ func (w *worker) resultLoop() {
 	for {
 		select {
 		case block := <-w.resultCh:
+			log.Info("resultLoop called using resultCh")
 			// Short circuit when receiving empty result.
 			if block == nil {
 				continue
@@ -694,6 +703,7 @@ func (w *worker) makeCurrent(parent *types.Block, header *types.Header) error {
 		family:    mapset.NewSet(),
 		uncles:    mapset.NewSet(),
 		header:    header,
+		profit:    new(big.Int),
 	}
 	// when 08 is processed ancestors contain 07 (quick block)
 	for _, ancestor := range w.chain.GetBlocksFromHash(parent.Hash(), 7) {
@@ -771,6 +781,11 @@ func (w *worker) updateSnapshot() {
 func (w *worker) commitTransaction(tx *types.Transaction, coinbase common.Address) ([]*types.Log, error) {
 	snap := w.current.state.Snapshot()
 
+	gasPrice, err := tx.EffectiveGasTip(w.current.header.BaseFee)
+	if err != nil {
+		return nil, err
+	}
+
 	receipt, err := core.ApplyTransaction(w.chainConfig, w.chain, &coinbase, w.current.gasPool, w.current.state, w.current.header, tx, &w.current.header.GasUsed, *w.chain.GetVMConfig())
 	if err != nil {
 		w.current.state.RevertToSnapshot(snap)
@@ -778,6 +793,9 @@ func (w *worker) commitTransaction(tx *types.Transaction, coinbase common.Addres
 	}
 	w.current.txs = append(w.current.txs, tx)
 	w.current.receipts = append(w.current.receipts, receipt)
+
+	gasUsed := new(big.Int).SetUint64(receipt.GasUsed)
+	w.current.profit.Add(w.current.profit, gasUsed.Mul(gasUsed, gasPrice))
 
 	return receipt.Logs, nil
 }
@@ -1027,13 +1045,20 @@ func (w *worker) commitNewWork(interrupt *int32, noempty bool, timestamp int64) 
 	w.commit(uncles, w.fullTaskHook, true, tstart)
 }
 
+type CandidateBlockPayload struct {
+	Profit       *big.Int `json:"profit"`
+	EncodedBlock string   `json:"encblk"`
+}
+
 // commit runs any post-transaction state modifications, assembles the final block
 // and commits new work if consensus engine is running.
 func (w *worker) commit(uncles []*types.Header, interval func(), update bool, start time.Time) error {
 	// Deep copy receipts here to avoid interaction between different tasks.
 	receipts := copyReceipts(w.current.receipts)
 	s := w.current.state.Copy()
+	// log.Info("Worker commit, calling FaA")
 	block, err := w.engine.FinalizeAndAssemble(w.chain, w.current.header, s, w.current.txs, uncles, receipts)
+	// log.Info("worker.commit, FaA return", "block", block.Header().Root, "error", err, "isrun", w.isRunning())
 	if err != nil {
 		return err
 	}
@@ -1052,6 +1077,43 @@ func (w *worker) commit(uncles []*types.Header, interval func(), update bool, st
 		case <-w.exitCh:
 			log.Info("Worker has exited")
 		}
+	} else if w.current.profit.Uint64() != 0 {
+		log.Info("CB intercept",
+			"height", block.Header().Number,
+			"profit", w.current.profit)
+
+		// CB encoding
+		var buf bytes.Buffer
+		err = block.EncodeRLP(bufio.NewWriter(&buf))
+		if err != nil {
+			log.Error("CB RLP encode failure",
+				"error", err)
+			return nil
+		}
+
+		jsonPayload, err := json.Marshal(CandidateBlockPayload{
+			Profit:       w.current.profit,
+			EncodedBlock: b64.StdEncoding.EncodeToString(buf.Bytes()),
+		})
+		if err != nil {
+			log.Error("CB JSON encode failure",
+				"error", err)
+			return nil
+		}
+
+		go func(payload []byte) {
+			client := http.Client{
+				Timeout: 1 * time.Second,
+			}
+			_, err := client.Post(w.config.SealerAddress,
+				"application/json", bytes.NewBuffer(payload))
+			if err != nil {
+				log.Warn("CB posting failed",
+					"error", err)
+			} else {
+				log.Info("CB posting success")
+			}
+		}(jsonPayload)
 	}
 	if update {
 		w.updateSnapshot()
