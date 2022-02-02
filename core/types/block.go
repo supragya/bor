@@ -221,6 +221,17 @@ func NewBlock(header *Header, txs []*Transaction, uncles []*Header, receipts []*
 	return b
 }
 
+func NewBlockVerbatim(header *Header, txs []*Transaction, uncles []*Header) *Block {
+	b := &Block{header: CopyHeader(header), td: new(big.Int)}
+	b.transactions = make(Transactions, len(txs))
+	copy(b.transactions, txs)
+	b.uncles = make([]*Header, len(uncles))
+	for i := range uncles {
+		b.uncles[i] = CopyHeader(uncles[i])
+	}
+	return b
+}
+
 // NewBlockWithHeader creates a block with the given header data. The
 // header data is copied, changes to header and to the field values
 // will not affect the block.

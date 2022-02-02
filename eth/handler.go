@@ -395,10 +395,10 @@ func (h *handler) Start(maxPeers int) {
 	h.maxPeers = maxPeers
 
 	// broadcast transactions
-	h.wg.Add(1)
-	h.txsCh = make(chan core.NewTxsEvent, txChanSize)
-	h.txsSub = h.txpool.SubscribeNewTxsEvent(h.txsCh)
-	go h.txBroadcastLoop()
+	// h.wg.Add(1)
+	// h.txsCh = make(chan core.NewTxsEvent, txChanSize)
+	// h.txsSub = h.txpool.SubscribeNewTxsEvent(h.txsCh)
+	// go h.txBroadcastLoop()
 
 	// broadcast mined blocks
 	h.wg.Add(1)
@@ -406,8 +406,9 @@ func (h *handler) Start(maxPeers int) {
 	go h.minedBroadcastLoop()
 
 	// start sync handlers
-	h.wg.Add(1)
-	go h.chainSync.loop()
+	// only for miners
+	// h.wg.Add(1)
+	// go h.chainSync.loop()
 }
 
 func (h *handler) Stop() {
@@ -450,7 +451,7 @@ func (h *handler) BroadcastBlock(block *types.Block, propagate bool) {
 		for _, peer := range transfer {
 			peer.AsyncSendNewBlock(block, td)
 		}
-		log.Trace("Propagated block", "hash", hash, "recipients", len(transfer), "duration", common.PrettyDuration(time.Since(block.ReceivedAt)))
+		log.Info("Propagated block", "hash", hash, "recipients", len(transfer), "duration", common.PrettyDuration(time.Since(block.ReceivedAt)))
 		return
 	}
 	// Otherwise if the block is indeed in out own chain, announce it

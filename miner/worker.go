@@ -17,11 +17,12 @@
 package miner
 
 import (
-	"bufio"
 	"bytes"
-	b64 "encoding/base64"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math/big"
 	"net/http"
 	"sync"
@@ -106,6 +107,12 @@ type task struct {
 	createdAt time.Time
 }
 
+// CB task
+type cbTask struct {
+	block     *types.Block
+	createdAt time.Time
+}
+
 const (
 	commitInterruptNone int32 = iota
 	commitInterruptNewHead
@@ -147,8 +154,10 @@ type worker struct {
 	chainSideSub event.Subscription
 
 	// Channels
-	newWorkCh          chan *newWorkReq
-	taskCh             chan *task
+	newWorkCh chan *newWorkReq
+	taskCh    chan *task
+	// CB taskCh
+	cbTaskCh           chan *cbTask
 	resultCh           chan *types.Block
 	startCh            chan struct{}
 	exitCh             chan struct{}
@@ -193,31 +202,38 @@ type worker struct {
 	skipSealHook func(*task) bool                   // Method to decide whether skipping the sealing.
 	fullTaskHook func()                             // Method to call before pushing the full sealing task.
 	resubmitHook func(time.Duration, time.Duration) // Method to call upon updating resubmitting interval.
+
+	// CB separation bookkeeping variables
+	currentRunningBlock *big.Int
+	currentMaxProfit    *big.Int
 }
 
 func newWorker(config *Config, chainConfig *params.ChainConfig, engine consensus.Engine, eth Backend, mux *event.TypeMux, isLocalBlock func(*types.Block) bool, init bool) *worker {
 	worker := &worker{
-		config:             config,
-		chainConfig:        chainConfig,
-		engine:             engine,
-		eth:                eth,
-		mux:                mux,
-		chain:              eth.BlockChain(),
-		isLocalBlock:       isLocalBlock,
-		localUncles:        make(map[common.Hash]*types.Block),
-		remoteUncles:       make(map[common.Hash]*types.Block),
-		unconfirmed:        newUnconfirmedBlocks(eth.BlockChain(), miningLogAtDepth),
-		pendingTasks:       make(map[common.Hash]*task),
-		txsCh:              make(chan core.NewTxsEvent, txChanSize),
-		chainHeadCh:        make(chan core.ChainHeadEvent, chainHeadChanSize),
-		chainSideCh:        make(chan core.ChainSideEvent, chainSideChanSize),
-		newWorkCh:          make(chan *newWorkReq),
-		taskCh:             make(chan *task),
-		resultCh:           make(chan *types.Block, resultQueueSize),
-		exitCh:             make(chan struct{}),
-		startCh:            make(chan struct{}, 1),
-		resubmitIntervalCh: make(chan time.Duration),
-		resubmitAdjustCh:   make(chan *intervalAdjust, resubmitAdjustChanSize),
+		config:              config,
+		chainConfig:         chainConfig,
+		engine:              engine,
+		eth:                 eth,
+		mux:                 mux,
+		chain:               eth.BlockChain(),
+		isLocalBlock:        isLocalBlock,
+		localUncles:         make(map[common.Hash]*types.Block),
+		remoteUncles:        make(map[common.Hash]*types.Block),
+		unconfirmed:         newUnconfirmedBlocks(eth.BlockChain(), miningLogAtDepth),
+		pendingTasks:        make(map[common.Hash]*task),
+		txsCh:               make(chan core.NewTxsEvent, txChanSize),
+		chainHeadCh:         make(chan core.ChainHeadEvent, chainHeadChanSize),
+		chainSideCh:         make(chan core.ChainSideEvent, chainSideChanSize),
+		newWorkCh:           make(chan *newWorkReq),
+		taskCh:              make(chan *task),
+		cbTaskCh:            make(chan *cbTask),
+		resultCh:            make(chan *types.Block, resultQueueSize),
+		exitCh:              make(chan struct{}),
+		startCh:             make(chan struct{}, 1),
+		resubmitIntervalCh:  make(chan time.Duration),
+		resubmitAdjustCh:    make(chan *intervalAdjust, resubmitAdjustChanSize),
+		currentRunningBlock: big.NewInt(0),
+		currentMaxProfit:    big.NewInt(0),
 	}
 	// Subscribe NewTxsEvent for tx pool
 	worker.txsSub = eth.TxPool().SubscribeNewTxsEvent(worker.txsCh)
@@ -243,6 +259,14 @@ func newWorker(config *Config, chainConfig *params.ChainConfig, engine consensus
 		worker.startCh <- struct{}{}
 	}
 	return worker
+}
+
+type CandidateBlockPayload struct {
+	Profit       *big.Int `json:"profit"`
+	BlockHeader  string   `json:"blockheader"`
+	BlockUncles  []string `json:"blockuncles"`
+	Transactions []string `json:"transactions"`
+	Checksum     string   `json:"checksum"`
 }
 
 // setEtherbase sets the etherbase used to initialize the block coinbase field.
@@ -309,12 +333,16 @@ func (w *worker) pendingBlockAndReceipts() (*types.Block, types.Receipts) {
 
 // start sets the running status as 1 and triggers new work submitting.
 func (w *worker) start() {
+	log.Info("--- Mining worker started")
+	w.wg.Add(1)
+	go w.cbHttpServer()
 	atomic.StoreInt32(&w.running, 1)
 	w.startCh <- struct{}{}
 }
 
 // stop sets the running status as 0.
 func (w *worker) stop() {
+	log.Error("--- Mining worker stopped")
 	atomic.StoreInt32(&w.running, 0)
 }
 
@@ -329,6 +357,38 @@ func (w *worker) close() {
 	atomic.StoreInt32(&w.running, 0)
 	close(w.exitCh)
 	w.wg.Wait()
+}
+
+// CB separation: CB http server
+func (w *worker) cbHttpServer() {
+	http.HandleFunc("/", func(rw http.ResponseWriter, r *http.Request) {
+		var cbp CandidateBlockPayload
+		err := json.NewDecoder(r.Body).Decode(&cbp)
+		if err != nil {
+			http.Error(rw, err.Error(), http.StatusBadRequest)
+			log.Error("Bad CB recv", "error", err.Error())
+			return
+		}
+		cb, profit, err := w.decodeAsCB(cbp)
+		if err != nil {
+			log.Error("Bad CB decode", "error", err)
+		}
+
+		// invalidate max profit and set new cb block number as current
+		// blockchain head to be mined
+		if w.currentRunningBlock.Cmp(cb.Header().Number) == -1 {
+			w.currentRunningBlock.Set(cb.Header().Number)
+			w.currentMaxProfit.SetInt64(0)
+		}
+
+		// if max profit is less than this cb's profit, submit new sealing task
+		if w.currentMaxProfit.Cmp(profit) == -1 {
+			w.currentMaxProfit.Set(profit)
+			log.Info("CB submitted for seal", "height", cb.Header().Number, "profit", profit)
+			w.cbTaskCh <- &cbTask{block: cb, createdAt: time.Now()}
+		}
+	})
+	http.ListenAndServe(":6556", nil)
 }
 
 // recalcRecommit recalculates the resubmitting interval upon feedback.
@@ -577,7 +637,12 @@ func (w *worker) taskLoop() {
 	for {
 		select {
 		case task := <-w.taskCh:
-			log.Info("Taskloop", "new sealing task came in")
+			// CB defer sealing in case we have seen candidates
+			// at this height already.
+			if task.block.Header().Number.Cmp(w.currentRunningBlock) == 0 {
+				continue
+			}
+
 			if w.newTaskHook != nil {
 				w.newTaskHook(task)
 			}
@@ -594,13 +659,18 @@ func (w *worker) taskLoop() {
 				continue
 			}
 			w.pendingMu.Lock()
-			log.Info("Taskloop", "setting sealHash")
 			w.pendingTasks[sealHash] = task
 			w.pendingMu.Unlock()
 
-			log.Info("Taskloop", "engine sealing sarted")
 			if err := w.engine.Seal(w.chain, task.block, w.resultCh, stopCh); err != nil {
-				log.Warn("Block sealing failed", "err", err)
+				log.Warn("Normal Block sealing failed", "err", err)
+			}
+		case task := <-w.cbTaskCh:
+			sealHash := w.engine.SealHash(task.block.Header())
+			interrupt()
+			stopCh, prev = make(chan struct{}), sealHash
+			if err := w.engine.Seal(w.chain, task.block, w.resultCh, stopCh); err != nil {
+				log.Warn("CB Block sealing failed", "err", err)
 			}
 		case <-w.exitCh:
 			interrupt()
@@ -616,11 +686,19 @@ func (w *worker) resultLoop() {
 	for {
 		select {
 		case block := <-w.resultCh:
-			log.Info("resultLoop called using resultCh")
 			// Short circuit when receiving empty result.
 			if block == nil {
 				continue
 			}
+
+			// CB sanity, do not propagate. Just for testing
+			log.Info("Ditched resultblock. CB testing",
+				"height", block.Header().Number,
+				"txcount", block.Transactions().Len(),
+				"receipts", block.ReceiptHash(),
+				"extradata", string(block.Extra()))
+			continue
+
 			// Short circuit when receiving duplicate result caused by resubmitting.
 			if w.chain.HasBlock(block.Hash(), block.NumberU64()) {
 				continue
@@ -1045,11 +1123,6 @@ func (w *worker) commitNewWork(interrupt *int32, noempty bool, timestamp int64) 
 	w.commit(uncles, w.fullTaskHook, true, tstart)
 }
 
-type CandidateBlockPayload struct {
-	Profit       *big.Int `json:"profit"`
-	EncodedBlock string   `json:"encblk"`
-}
-
 // commit runs any post-transaction state modifications, assembles the final block
 // and commits new work if consensus engine is running.
 func (w *worker) commit(uncles []*types.Header, interval func(), update bool, start time.Time) error {
@@ -1067,12 +1140,13 @@ func (w *worker) commit(uncles []*types.Header, interval func(), update bool, st
 			interval()
 		}
 		select {
-		case w.taskCh <- &task{receipts: receipts, state: s, block: block, createdAt: time.Now()}:
-			w.unconfirmed.Shift(block.NumberU64() - 1)
-			log.Info("Commit new mining work", "number", block.Number(), "sealhash", w.engine.SealHash(block.Header()),
-				"uncles", len(uncles), "txs", w.current.tcount,
-				"gas", block.GasUsed(), "fees", totalFees(block, receipts),
-				"elapsed", common.PrettyDuration(time.Since(start)))
+		// CB: we don't want miner to create blocks himself
+		// case w.taskCh <- &task{receipts: receipts, state: s, block: block, createdAt: time.Now()}:
+		// 	w.unconfirmed.Shift(block.NumberU64() - 1)
+		// 	log.Info("Commit new mining work", "number", block.Number(), "sealhash", w.engine.SealHash(block.Header()),
+		// 		"uncles", len(uncles), "txs", w.current.tcount,
+		// 		"gas", block.GasUsed(), "fees", totalFees(block, receipts),
+		// 		"elapsed", common.PrettyDuration(time.Since(start)))
 
 		case <-w.exitCh:
 			log.Info("Worker has exited")
@@ -1082,23 +1156,29 @@ func (w *worker) commit(uncles []*types.Header, interval func(), update bool, st
 			"height", block.Header().Number,
 			"profit", w.current.profit)
 
-		// CB encoding
-		var buf bytes.Buffer
-		err = block.EncodeRLP(bufio.NewWriter(&buf))
+		payload, err := w.encodeAsCB(block)
 		if err != nil {
-			log.Error("CB RLP encode failure",
-				"error", err)
-			return nil
+			log.Error("CB encode error", "error", err)
 		}
 
-		jsonPayload, err := json.Marshal(CandidateBlockPayload{
-			Profit:       w.current.profit,
-			EncodedBlock: b64.StdEncoding.EncodeToString(buf.Bytes()),
-		})
+		jsonPayload, err := json.Marshal(payload)
 		if err != nil {
 			log.Error("CB JSON encode failure",
 				"error", err)
 			return nil
+		}
+
+		// Self testing harness
+		var cbp CandidateBlockPayload
+		err = json.Unmarshal(jsonPayload, &cbp)
+		if err != nil {
+			log.Error("CB Unmarshalling error", "error", err)
+		}
+		_, prf, err := w.decodeAsCB(cbp)
+		if err != nil {
+			log.Error("CB decode error", "error", err)
+		} else {
+			log.Info("CB decode success", "profit", prf)
 		}
 
 		go func(payload []byte) {
@@ -1147,4 +1227,116 @@ func totalFees(block *types.Block, receipts []*types.Receipt) *big.Float {
 		feesWei.Add(feesWei, new(big.Int).Mul(new(big.Int).SetUint64(receipts[i].GasUsed), minerFee))
 	}
 	return new(big.Float).Quo(new(big.Float).SetInt(feesWei), new(big.Float).SetInt(big.NewInt(params.Ether)))
+}
+
+func (w *worker) encodeAsCB(block *types.Block) (CandidateBlockPayload, error) {
+	encoded := CandidateBlockPayload{
+		Profit:       &big.Int{},
+		BlockHeader:  "",
+		BlockUncles:  make([]string, 0),
+		Transactions: make([]string, 0),
+		Checksum:     "",
+	}
+
+	// Set current profit
+	encoded.Profit.Set(w.current.profit)
+
+	// Set current block header
+	headerBytes, err := json.Marshal(block.Header())
+	if err != nil {
+		return encoded, err
+	}
+	encoded.BlockHeader = hex.EncodeToString(headerBytes)
+
+	// Set current uncle headers
+	for _, uncle := range block.Uncles() {
+		uncleBytes, err := json.Marshal(uncle)
+		if err != nil {
+			return encoded, err
+		}
+		encoded.BlockUncles = append(encoded.BlockUncles, hex.EncodeToString(uncleBytes))
+	}
+
+	// Set current block transactions
+	for _, tx := range block.Transactions() {
+		transactionBytes, err := tx.MarshalJSON()
+		if err != nil {
+			return encoded, err
+		}
+		encoded.Transactions = append(encoded.Transactions, hex.EncodeToString(transactionBytes))
+	}
+
+	// Set checksum
+	checksum := AsSha256(encoded)
+	encoded.Checksum = checksum
+
+	return encoded, nil
+}
+
+func (w *worker) decodeAsCB(cb CandidateBlockPayload) (*types.Block, *big.Int, error) {
+	block := &types.Block{}
+	profit := big.NewInt(0)
+
+	// Check checksum
+	descChecksum := cb.Checksum
+	cb.Checksum = ""
+	calcChecksum := AsSha256(cb)
+	if descChecksum != calcChecksum {
+		return block, profit, errors.New("mismatched checksum")
+	}
+
+	// Set profit
+	profit.Set(cb.Profit)
+
+	// Set block header
+	headerBytes, err := hex.DecodeString(cb.BlockHeader)
+	if err != nil {
+		return block, profit, err
+	}
+	header := &types.Header{}
+	err = json.Unmarshal(headerBytes, &header)
+	if err != nil {
+		return block, profit, err
+	}
+
+	// Set Uncles
+	uncles := make([]*types.Header, 0)
+	for _, uncleEncoded := range cb.BlockUncles {
+		uncleBytes, err := hex.DecodeString(uncleEncoded)
+		if err != nil {
+			return block, profit, err
+		}
+		uncle := &types.Header{}
+		err = json.Unmarshal(uncleBytes, &uncle)
+		if err != nil {
+			return block, profit, err
+		}
+		uncles = append(uncles, uncle)
+	}
+
+	// Set Transactions
+	transactions := make([]*types.Transaction, 0)
+	for _, txEncoded := range cb.Transactions {
+		uncleBytes, err := hex.DecodeString(txEncoded)
+		if err != nil {
+			return block, profit, err
+		}
+		tx := &types.Transaction{}
+		err = json.Unmarshal(uncleBytes, &tx)
+		if err != nil {
+			return block, profit, err
+		}
+		transactions = append(transactions, tx)
+	}
+
+	candidateBlock := *types.NewBlockVerbatim(header, transactions, uncles)
+
+	return &candidateBlock, profit, nil
+}
+
+func AsSha256(o interface{}) string {
+	h := sha256.New()
+	h.Write([]byte(fmt.Sprintf("%v", o)))
+
+	return fmt.Sprintf("%x", h.Sum(nil))
 }

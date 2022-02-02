@@ -827,26 +827,31 @@ func (c *Bor) Seal(chain consensus.ChainHeaderReader, block *types.Block, result
 	signer, signFn := c.signer, c.signFn
 	c.lock.RUnlock()
 
-	snap, err := c.snapshot(chain, number-1, header.ParentHash, nil)
-	if err != nil {
-		return err
-	}
+	// CB short circuit: No snap search,
+	// Warning: Validator will still produce blocks even if he / she is not in
+	// validator set here. It is entirely now dependent on CB generators
+	// being trusted
+
+	// snap, err := c.snapshot(chain, number-1, header.ParentHash, nil)
+	// if err != nil {
+	// 	return err
+	// }
 
 	// Bail out if we're unauthorized to sign a block
-	if !snap.ValidatorSet.HasAddress(signer.Bytes()) {
-		// Check the UnauthorizedSignerError.Error() msg to see why we pass number-1
-		return &UnauthorizedSignerError{number - 1, signer.Bytes()}
-	}
+	// if !snap.ValidatorSet.HasAddress(signer.Bytes()) {
+	// 	// Check the UnauthorizedSignerError.Error() msg to see why we pass number-1
+	// 	return &UnauthorizedSignerError{number - 1, signer.Bytes()}
+	// }
 
-	successionNumber, err := snap.GetSignerSuccessionNumber(signer)
-	if err != nil {
-		return err
-	}
+	// successionNumber, err := snap.GetSignerSuccessionNumber(signer)
+	// if err != nil {
+	// 	return err
+	// }
 
 	// Sweet, the protocol permits us to sign the block, wait for our time
 	delay := time.Unix(int64(header.Time), 0).Sub(time.Now()) // nolint: gosimple
 	// wiggle was already accounted for in header.Time, this is just for logging
-	wiggle := time.Duration(successionNumber) * time.Duration(c.config.CalculateBackupMultiplier(number)) * time.Second
+	// wiggle := time.Duration(successionNumber) * time.Duration(c.config.CalculateBackupMultiplier(number)) * time.Second
 
 	// Sign all the things!
 	sighash, err := signFn(accounts.Account{Address: signer}, accounts.MimetypeBor, BorRLP(header, c.config))
@@ -863,14 +868,14 @@ func (c *Bor) Seal(chain consensus.ChainHeaderReader, block *types.Block, result
 			log.Debug("Discarding sealing operation for block", "number", number)
 			return
 		case <-time.After(delay):
-			if wiggle > 0 {
-				log.Info(
-					"Sealing out-of-turn",
-					"number", number,
-					"wiggle", common.PrettyDuration(wiggle),
-					"in-turn-signer", snap.ValidatorSet.GetProposer().Address.Hex(),
-				)
-			}
+			// if wiggle > 0 {
+			// 	log.Info(
+			// 		"Sealing out-of-turn",
+			// 		"number", number,
+			// 		// "wiggle", common.PrettyDuration(wiggle),
+			// 		// "in-turn-signer", snap.ValidatorSet.GetProposer().Address.Hex(),
+			// 	)
+			// }
 			log.Info(
 				"Sealing successful",
 				"number", number,
