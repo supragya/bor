@@ -439,13 +439,17 @@ func (h *handler) BroadcastBlock(block *types.Block, propagate bool) {
 	// If propagation is requested, send to a subset of the peer
 	if propagate {
 		// Calculate the TD of the block (it's not imported yet, so block.Td is not valid)
-		var td *big.Int
-		if parent := h.chain.GetBlock(block.ParentHash(), block.NumberU64()-1); parent != nil {
-			td = new(big.Int).Add(block.Difficulty(), h.chain.GetTd(block.ParentHash(), block.NumberU64()-1))
-		} else {
-			log.Error("Propagating dangling block", "number", block.Number(), "hash", hash)
-			return
-		}
+		// var td *big.Int
+		// if parent := h.chain.GetBlock(block.ParentHash(), block.NumberU64()-1); parent != nil {
+		// 	td = new(big.Int).Add(block.Difficulty(), h.chain.GetTd(block.ParentHash(), block.NumberU64()-1))
+		// } else {
+		// 	log.Error("Propagating dangling block", "number", block.Number(), "hash", hash)
+		// 	return
+		// }
+
+		// CB: Works for polygon for now
+		td := big.NewInt(1)
+
 		// Send the block to a subset of our peers
 		transfer := peers[:int(math.Sqrt(float64(len(peers))))]
 		for _, peer := range transfer {

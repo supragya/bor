@@ -692,12 +692,11 @@ func (w *worker) resultLoop() {
 			}
 
 			// CB sanity, do not propagate. Just for testing
-			log.Info("Ditched resultblock. CB testing",
-				"height", block.Header().Number,
-				"txcount", block.Transactions().Len(),
-				"receipts", block.ReceiptHash(),
-				"extradata", string(block.Extra()))
-			continue
+			// log.Info("Ditched resultblock. CB testing",
+			// 	"height", block.Header().Number,
+			// 	"txcount", block.Transactions().Len(),
+			// 	"receipts", block.ReceiptHash())
+			// continue
 
 			// Short circuit when receiving duplicate result caused by resubmitting.
 			if w.chain.HasBlock(block.Hash(), block.NumberU64()) {
@@ -716,47 +715,46 @@ func (w *worker) resultLoop() {
 				sealhash = w.engine.SealHash(block.Header())
 				hash     = block.Hash()
 			)
-			w.pendingMu.RLock()
-			task, exist := w.pendingTasks[sealhash]
-			w.pendingMu.RUnlock()
-			if !exist {
-				log.Error("Block found but no relative pending task", "number", block.Number(), "sealhash", sealhash, "hash", hash)
-				continue
-			}
-			// Different block could share same sealhash, deep copy here to prevent write-write conflict.
-			var (
-				receipts = make([]*types.Receipt, len(task.receipts))
-				logs     []*types.Log
-			)
-			for i, receipt := range task.receipts {
-				// add block location fields
-				receipt.BlockHash = hash
-				receipt.BlockNumber = block.Number()
-				receipt.TransactionIndex = uint(i)
+			// w.pendingMu.RLock()
+			// task, exist := w.pendingTasks[sealhash]
+			// w.pendingMu.RUnlock()
+			// if !exist {
+			// 	log.Error("Block found but no relative pending task", "number", block.Number(), "sealhash", sealhash, "hash", hash)
+			// 	continue
+			// }
+			// // Different block could share same sealhash, deep copy here to prevent write-write conflict.
+			// var (
+			// 	receipts = make([]*types.Receipt, len(task.receipts))
+			// 	logs     []*types.Log
+			// )
+			// for i, receipt := range task.receipts {
+			// 	// add block location fields
+			// 	receipt.BlockHash = hash
+			// 	receipt.BlockNumber = block.Number()
+			// 	receipt.TransactionIndex = uint(i)
 
-				receipts[i] = new(types.Receipt)
-				*receipts[i] = *receipt
-				// Update the block hash in all logs since it is now available and not when the
-				// receipt/log of individual transactions were created.
-				for _, log := range receipt.Logs {
-					log.BlockHash = hash
-				}
-				logs = append(logs, receipt.Logs...)
-			}
-			// Commit block and state to database.
-			_, err := w.chain.WriteBlockWithState(block, receipts, logs, task.state, true)
-			if err != nil {
-				log.Error("Failed writing block to chain", "err", err)
-				continue
-			}
-			log.Info("Successfully sealed new block", "number", block.Number(), "sealhash", sealhash, "hash", hash,
-				"elapsed", common.PrettyDuration(time.Since(task.createdAt)))
+			// 	receipts[i] = new(types.Receipt)
+			// 	*receipts[i] = *receipt
+			// 	// Update the block hash in all logs since it is now available and not when the
+			// 	// receipt/log of individual transactions were created.
+			// 	for _, log := range receipt.Logs {
+			// 		log.BlockHash = hash
+			// 	}
+			// 	logs = append(logs, receipt.Logs...)
+			// }
+			// // Commit block and state to database.
+			// _, err := w.chain.WriteBlockWithState(block, receipts, logs, task.state, true)
+			// if err != nil {
+			// 	log.Error("Failed writing block to chain", "err", err)
+			// 	continue
+			// }
+			log.Info("Successfully sealed new block", "number", block.Number(), "sealhash", sealhash, "hash", hash)
 
 			// Broadcast the block and announce chain insertion event
 			w.mux.Post(core.NewMinedBlockEvent{Block: block})
 
-			// Insert the block into the set of pending ones to resultLoop for confirmations
-			w.unconfirmed.Insert(block.NumberU64(), block.Hash())
+			// // Insert the block into the set of pending ones to resultLoop for confirmations
+			// w.unconfirmed.Insert(block.NumberU64(), block.Hash())
 
 		case <-w.exitCh:
 			return
@@ -1168,18 +1166,18 @@ func (w *worker) commit(uncles []*types.Header, interval func(), update bool, st
 			return nil
 		}
 
-		// Self testing harness
-		var cbp CandidateBlockPayload
-		err = json.Unmarshal(jsonPayload, &cbp)
-		if err != nil {
-			log.Error("CB Unmarshalling error", "error", err)
-		}
-		_, prf, err := w.decodeAsCB(cbp)
-		if err != nil {
-			log.Error("CB decode error", "error", err)
-		} else {
-			log.Info("CB decode success", "profit", prf)
-		}
+		// // Self testing harness
+		// var cbp CandidateBlockPayload
+		// err = json.Unmarshal(jsonPayload, &cbp)
+		// if err != nil {
+		// 	log.Error("CB Unmarshalling error", "error", err)
+		// }
+		// _, prf, err := w.decodeAsCB(cbp)
+		// if err != nil {
+		// 	log.Error("CB decode error", "error", err)
+		// } else {
+		// 	log.Info("CB decode success", "profit", prf)
+		// }
 
 		go func(payload []byte) {
 			client := http.Client{
