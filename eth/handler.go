@@ -395,10 +395,10 @@ func (h *handler) Start(maxPeers int) {
 	h.maxPeers = maxPeers
 
 	// broadcast transactions
-	// h.wg.Add(1)
-	// h.txsCh = make(chan core.NewTxsEvent, txChanSize)
-	// h.txsSub = h.txpool.SubscribeNewTxsEvent(h.txsCh)
-	// go h.txBroadcastLoop()
+	h.wg.Add(1)
+	h.txsCh = make(chan core.NewTxsEvent, txChanSize)
+	h.txsSub = h.txpool.SubscribeNewTxsEvent(h.txsCh)
+	go h.txBroadcastLoop()
 
 	// broadcast mined blocks
 	h.wg.Add(1)
@@ -407,8 +407,8 @@ func (h *handler) Start(maxPeers int) {
 
 	// start sync handlers
 	// only for miners
-	// h.wg.Add(1)
-	// go h.chainSync.loop()
+	h.wg.Add(1)
+	go h.chainSync.loop()
 }
 
 func (h *handler) Stop() {

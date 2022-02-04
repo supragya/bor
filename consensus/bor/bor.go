@@ -622,6 +622,8 @@ func (c *Bor) verifySeal(chain consensus.ChainHeaderReader, header *types.Header
 // Prepare implements consensus.Engine, preparing all the consensus fields of the
 // header for running the transactions on top.
 func (c *Bor) Prepare(chain consensus.ChainHeaderReader, header *types.Header) error {
+	sealeraddr := header.Coinbase
+
 	// If the block isn't a checkpoint, cast a random vote (good enough for now)
 	header.Coinbase = common.Address{}
 	header.Nonce = types.BlockNonce{}
@@ -670,12 +672,14 @@ func (c *Bor) Prepare(chain consensus.ChainHeaderReader, header *types.Header) e
 
 	var succession int
 	// if signer is not empty
-	if bytes.Compare(c.signer.Bytes(), common.Address{}.Bytes()) != 0 {
-		succession, err = snap.GetSignerSuccessionNumber(c.signer)
+	if bytes.Compare(sealeraddr.Bytes(), common.Address{}.Bytes()) != 0 {
+		succession, err = snap.GetSignerSuccessionNumber(sealeraddr)
 		if err != nil {
 			return err
 		}
 	}
+
+	log.Info("CB preparation succession", "number", succession)
 
 	header.Time = parent.Time + CalcProducerDelay(number, succession, c.config)
 	if header.Time < uint64(time.Now().Unix()) {
